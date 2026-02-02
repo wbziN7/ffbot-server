@@ -8,7 +8,7 @@ import json
 app = Flask(__name__)
 
 # Senha do admin (MUDE ISSO!)
-ADMIN_PASSWORD = "admin123"
+ADMIN_PASSWORD = "Wb03122008!"
 
 # =====================================================
 # BANCO DE DADOS
