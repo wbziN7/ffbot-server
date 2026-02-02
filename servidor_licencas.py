@@ -26,6 +26,8 @@ def init_db():
                   dias INTEGER NOT NULL,
                   ativada INTEGER DEFAULT 0,
                   hwid TEXT,
+                  nome_discord TEXT,
+                  telegram_id TEXT,
                   data_ativacao TEXT,
                   data_expiracao TEXT,
                   data_criacao TEXT NOT NULL)''')
@@ -136,12 +138,14 @@ def gerar_key():
 def ativar_key():
     """
     Ativa uma key no HWID do usuário
-    Body: {"key": "ABC123...", "hwid": "HWID-DO-PC"}
+    Body: {"key": "ABC123...", "hwid": "HWID-DO-PC", "nome_discord": "User#1234", "telegram_id": "123456"}
     """
     try:
         data = request.json
         key = data.get('key', '').upper().strip()
         hwid = data.get('hwid', '').strip()
+        nome_discord = data.get('nome_discord', '').strip()
+        telegram_id = data.get('telegram_id', '').strip()
         
         if not key or not hwid:
             return jsonify({"success": False, "error": "Key e HWID são obrigatórios"}), 400
@@ -157,7 +161,8 @@ def ativar_key():
             conn.close()
             return jsonify({"success": False, "error": "Key não encontrada"}), 404
         
-        key_db, tipo, dias, ativada, hwid_db, data_ativ, data_exp, data_cria = resultado
+        # Desempacotar resultado com novos campos
+        key_db, tipo, dias, ativada, hwid_db, nome_disc_db, tg_id_db, data_ativ, data_exp, data_cria = resultado
         
         # Verificar se já foi ativada
         if ativada == 1:
@@ -169,9 +174,10 @@ def ativar_key():
         data_expiracao = calcular_expiracao(dias)
         
         c.execute('''UPDATE keys 
-                    SET ativada = 1, hwid = ?, data_ativacao = ?, data_expiracao = ?
+                    SET ativada = 1, hwid = ?, nome_discord = ?, telegram_id = ?, 
+                        data_ativacao = ?, data_expiracao = ?
                     WHERE key = ?''',
-                 (hwid, data_ativacao, data_expiracao, key))
+                 (hwid, nome_discord, telegram_id, data_ativacao, data_expiracao, key))
         
         conn.commit()
         conn.close()
@@ -215,7 +221,7 @@ def validar_licenca():
                 "error": "Nenhuma licença encontrada para este PC"
             }), 404
         
-        key_db, tipo, dias, ativada, hwid_db, data_ativ, data_exp, data_cria = resultado
+        key_db, tipo, dias, ativada, hwid_db, nome_discord, telegram_id, data_ativ, data_exp, data_cria = resultado
         
         # Verificar se expirou
         if verificar_expiracao(data_exp):
