@@ -2,718 +2,445 @@
 from flask import Flask, jsonify, request, render_template_string
 import sqlite3
 import secrets
-import hashlib
-import hmac
-import base64
 from datetime import datetime, timedelta
 import requests
 import os
 
 app = Flask(__name__)
 
-# =====================================================
-# CONFIG (Railway Variables recomendado)
-# =====================================================
-ADMIN_PASSWORD = os.getenv("Wb03122008!", "Wb03122008!")
-DB_NAME = os.getenv("DB_NAME", "licencas.db")
+# =========================
+# CONFIG (use Railway Variables)
+# =========================
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Wb03122008!")
 SALASFF_API_URL = os.getenv("SALASFF_API_URL", "https://salasff.com")
+
+DB_NAME = os.getenv("DB_NAME", "licencas.db")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
-# Chave para "proteger" a API key do cliente no banco (melhor que nada)
-# Coloque uma string grande no Railway Variables: MASTER_KEY
-MASTER_KEY = os.getenv("MASTER_KEY", "HGIJFS8VDW8V7V4J73M2RV283RN732VNGF283FVGN238RVGN2387RV32BGR872FH892HFNMC8732RV32Y")
-
-# Limite de dispositivos por licença (anti-compartilhamento)
-MAX_DEVICES = int(os.getenv("MAX_DEVICES", "1"))
-
-
-# =====================================================
+# =========================
 # DB helpers
-# =====================================================
-
-def db():
-    conn = sqlite3.connect(DB_NAME)
+# =========================
+def db_conn():
+    # timeout alto + check_same_thread False reduz travamentos no Railway
+    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     return conn
 
-def utcnow_str():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-def sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def hmac_sha256_hex(key: str, msg: str) -> str:
-    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def _xor_encrypt_to_b64(plaintext: str, key: str) -> str:
-    # Não é criptografia “de banco”, mas impede vazamento bobo.
-    # Se quiser ficar sério: migra p/ Postgres + cryptography.
-    if plaintext is None:
-        return ""
-    kb = hashlib.sha256(key.encode("utf-8")).digest()
-    pb = plaintext.encode("utf-8")
-    out = bytes([pb[i] ^ kb[i % len(kb)] for i in range(len(pb))])
-    return base64.urlsafe_b64encode(out).decode("ascii")
-
-def _xor_decrypt_from_b64(cipher_b64: str, key: str) -> str:
-    if not cipher_b64:
-        return ""
-    kb = hashlib.sha256(key.encode("utf-8")).digest()
-    cb = base64.urlsafe_b64decode(cipher_b64.encode("ascii"))
-    out = bytes([cb[i] ^ kb[i % len(kb)] for i in range(len(cb))])
-    return out.decode("utf-8", errors="replace")
-
-
 def init_db():
-    con = db()
-    cur = con.cursor()
+    conn = db_conn()
+    c = conn.cursor()
 
-    # licencas
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS licenses (
-        license_key TEXT PRIMARY KEY,
+    # Keys do SEU sistema (licenças)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS keys (
+        key TEXT PRIMARY KEY,
         tipo TEXT NOT NULL,
         dias INTEGER NOT NULL,
         ativada INTEGER DEFAULT 0,
-        customer_id TEXT,
-        hwid_primeiro TEXT,
-        data_criacao TEXT NOT NULL,
+        hwid TEXT,
         data_ativacao TEXT,
-        data_expiracao TEXT
+        data_expiracao TEXT,
+        data_criacao TEXT NOT NULL
     )
     """)
 
-    # clientes
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS customers (
-        customer_id TEXT PRIMARY KEY,
-        token_hash TEXT NOT NULL,
-        status TEXT NOT NULL,
-        salasff_key_enc TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT
-    )
-    """)
-
-    # devices
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS devices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id TEXT NOT NULL,
-        hwid TEXT NOT NULL,
-        first_seen TEXT NOT NULL,
-        last_seen TEXT NOT NULL,
-        UNIQUE(customer_id, hwid)
-    )
-    """)
-
-    # nonces (anti replay simples)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS nonces (
-        nonce TEXT PRIMARY KEY,
-        customer_id TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )
-    """)
-
-    # logs
-    cur.execute("""
+    # Logs
+    c.execute("""
     CREATE TABLE IF NOT EXISTS logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id TEXT,
         hwid TEXT,
-        acao TEXT NOT NULL,
-        data TEXT NOT NULL,
+        acao TEXT,
+        data TEXT,
         detalhes TEXT
     )
     """)
 
-    con.commit()
-    con.close()
-    print("DB OK")
+    # DADOS DO CLIENTE (aqui fica a API key do SalasFF DELE)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+        hwid TEXT PRIMARY KEY,
+        salasff_key TEXT,
+        updated_at TEXT
+    )
+    """)
 
+    conn.commit()
+    conn.close()
 
-def registrar_log(customer_id, hwid, acao, detalhes=""):
-    try:
-        con = db()
-        cur = con.cursor()
-        cur.execute(
-            "INSERT INTO logs (customer_id, hwid, acao, data, detalhes) VALUES (?, ?, ?, ?, ?)",
-            (customer_id, hwid, acao, utcnow_str(), detalhes),
-        )
-        con.commit()
-        con.close()
-    except Exception as e:
-        print("LOG FAIL:", e)
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
-# =====================================================
-# Licenca
-# =====================================================
-
-def calcular_expiracao(dias: int):
-    if dias == -1:
-        return "PERMANENTE"
-    return (datetime.utcnow() + timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S")
-
-def expirou(data_expiracao: str) -> bool:
-    if data_expiracao == "PERMANENTE":
-        return False
-    dt = datetime.strptime(data_expiracao, "%Y-%m-%d %H:%M:%S")
-    return datetime.utcnow() > dt
-
-def gerar_key_unica() -> str:
+def gerar_key_unica():
     return secrets.token_hex(16).upper()
 
-def gerar_customer_id() -> str:
-    return "CUST_" + secrets.token_hex(8).upper()
+def calcular_expiracao(dias):
+    if dias == -1:
+        return "PERMANENTE"
+    return (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S")
 
-def gerar_token() -> str:
-    # token “grande”
-    return secrets.token_urlsafe(48)
+def verificar_expiracao(data_expiracao):
+    if data_expiracao == "PERMANENTE":
+        return False
+    data_exp = datetime.strptime(data_expiracao, "%Y-%m-%d %H:%M:%S")
+    return datetime.now() > data_exp
 
-
-# =====================================================
-# Auth do cliente (TOKEN + assinatura HMAC)
-# =====================================================
-
-def autenticar_cliente_requisicao():
-    """
-    Espera:
-      Headers:
-        X-Client-Token: token
-        X-Timestamp: unix int (segundos)
-        X-Nonce: string
-        X-Signature: hex hmac_sha256(token, f"{ts}\n{nonce}\n{path}\n{raw_body}")
-      Body: JSON normal
-    """
-    token = request.headers.get("X-Client-Token", "").strip()
-    ts = request.headers.get("X-Timestamp", "").strip()
-    nonce = request.headers.get("X-Nonce", "").strip()
-    sig = request.headers.get("X-Signature", "").strip()
-
-    if not token or not ts or not nonce or not sig:
-        return (False, None, "Cabecalhos de autenticacao faltando")
-
-    # janela de tempo (2 min)
+def registrar_log(hwid, acao, detalhes=""):
     try:
-        ts_int = int(ts)
-    except ValueError:
-        return (False, None, "Timestamp invalido")
-
-    now_int = int(datetime.utcnow().timestamp())
-    if abs(now_int - ts_int) > 120:
-        return (False, None, "Timestamp fora da janela")
-
-    # buscar cliente pelo hash do token
-    token_hash = sha256_hex(token)
-
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM customers WHERE token_hash = ? AND status = 'active'", (token_hash,))
-    cust = cur.fetchone()
-
-    if not cust:
-        con.close()
-        return (False, None, "Token invalido")
-
-    customer_id = cust["customer_id"]
-
-    # nonce replay check
-    cur.execute("SELECT nonce FROM nonces WHERE nonce = ?", (nonce,))
-    if cur.fetchone():
-        con.close()
-        return (False, None, "Nonce repetido")
-
-    # validar assinatura
-    raw_body = request.get_data(as_text=True) or ""
-    msg = f"{ts}\n{nonce}\n{request.path}\n{raw_body}"
-    expected = hmac_sha256_hex(token, msg)
-    if not hmac.compare_digest(expected, sig):
-        con.close()
-        return (False, None, "Assinatura invalida")
-
-    # salvar nonce
-    cur.execute(
-        "INSERT INTO nonces (nonce, customer_id, created_at) VALUES (?, ?, ?)",
-        (nonce, customer_id, utcnow_str()),
-    )
-    con.commit()
-    con.close()
-
-    return (True, customer_id, "")
-
-
-def validar_hwid_do_cliente(customer_id: str, hwid: str):
-    """
-    Enforce MAX_DEVICES por cliente.
-    """
-    hwid = (hwid or "").strip()
-    if not hwid:
-        return (False, "HWID obrigatorio")
-
-    con = db()
-    cur = con.cursor()
-
-    # contar devices
-    cur.execute("SELECT COUNT(*) AS c FROM devices WHERE customer_id = ?", (customer_id,))
-    total = int(cur.fetchone()["c"])
-
-    # se ja existe, atualiza last_seen
-    cur.execute("SELECT id FROM devices WHERE customer_id = ? AND hwid = ?", (customer_id, hwid))
-    row = cur.fetchone()
-    if row:
-        cur.execute(
-            "UPDATE devices SET last_seen = ? WHERE customer_id = ? AND hwid = ?",
-            (utcnow_str(), customer_id, hwid),
+        conn = db_conn()
+        conn.execute(
+            "INSERT INTO logs (hwid, acao, data, detalhes) VALUES (?, ?, ?, ?)",
+            (hwid or "N/A", acao, now_str(), detalhes or "")
         )
-        con.commit()
-        con.close()
-        return (True, "")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
-    # novo device
-    if total >= MAX_DEVICES:
-        con.close()
-        return (False, f"Limite de dispositivos atingido ({MAX_DEVICES}).")
+def validar_licenca_interna(hwid):
+    try:
+        conn = db_conn()
+        row = conn.execute(
+            "SELECT * FROM keys WHERE hwid = ? AND ativada = 1",
+            (hwid,)
+        ).fetchone()
+        conn.close()
 
-    cur.execute(
-        "INSERT INTO devices (customer_id, hwid, first_seen, last_seen) VALUES (?, ?, ?, ?)",
-        (customer_id, hwid, utcnow_str(), utcnow_str()),
-    )
-    con.commit()
-    con.close()
-    return (True, "")
+        if not row:
+            return False
 
+        data_exp = row["data_expiracao"]
+        if verificar_expiracao(data_exp):
+            return False
 
-def cliente_tem_key(customer_id: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT salasff_key_enc FROM customers WHERE customer_id = ?", (customer_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return (False, "")
-    enc = row["salasff_key_enc"]
-    if not enc:
-        return (False, "")
-    return (True, _xor_decrypt_from_b64(enc, MASTER_KEY))
+        return True
+    except Exception as e:
+        registrar_log(hwid, "VALIDAR_LICENCA_ERRO", str(e))
+        return False
 
+def get_salasff_key_do_cliente(hwid):
+    conn = db_conn()
+    row = conn.execute("SELECT salasff_key FROM clients WHERE hwid = ?", (hwid,)).fetchone()
+    conn.close()
+    return row["salasff_key"] if row and row["salasff_key"] else None
 
-def checar_licenca_customer(customer_id: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM licenses WHERE customer_id = ? AND ativada = 1", (customer_id,))
-    lic = cur.fetchone()
-    con.close()
-
-    if not lic:
-        return (False, "Licenca nao encontrada para este cliente")
-
-    data_exp = lic["data_expiracao"]
-    if data_exp and expirou(data_exp):
-        return (False, "Licenca expirada")
-
-    return (True, "")
-
-
-# =====================================================
+# =========================
 # ROTAS
-# =====================================================
+# =========================
 
 @app.route("/")
 def home():
     return jsonify({
         "status": "online",
-        "sistema": "API Licencas + Proxy (API Key por cliente)",
+        "sistema": "API de Licencas - Free Fire Bot",
+        "versao": "3.0 - SalasFF Key por cliente",
         "rotas": {
-            "GET /admin": "Painel admin",
-            "POST /gerar-key": "Admin gera keys",
-            "POST /ativar-key": "Cliente ativa key e recebe token",
-            "POST /cliente/set-salasff-key": "Cliente cadastra a API key dele",
-            "POST /validar-licenca": "Cliente valida token + licenca",
-            "POST /proxy-criar-sala": "Cria sala usando API key do cliente",
+            "POST /gerar-key": "Gera key (admin)",
+            "POST /ativar-key": "Ativa key no HWID",
+            "POST /validar-licenca": "Valida licenca",
+            "POST /admin/set-salasff-key": "Define API key SalasFF do cliente (admin)",
+            "POST /proxy-criar-sala": "Cria sala usando a key do cliente",
             "POST /proxy-info-sala": "Info sala",
-            "POST /proxy-iniciar-partida": "Inicia partida",
-            "POST /stats": "Admin stats",
+            "POST /proxy-iniciar-partida": "Iniciar partida",
+            "GET /admin": "Painel admin"
         }
     })
 
-
-# ---------------- ADMIN ----------------
-
 @app.route("/gerar-key", methods=["POST"])
 def gerar_key():
-    data = request.get_json(silent=True) or {}
-    senha = data.get("senha")
-    tipo = data.get("tipo", "1d")
-    quantidade = int(data.get("quantidade", 1))
+    try:
+        data = request.get_json(silent=True) or {}
+        senha = data.get("senha")
+        tipo = data.get("tipo", "1d")
+        quantidade = int(data.get("quantidade", 1))
 
-    if senha != ADMIN_PASSWORD:
-        return jsonify({"success": False, "error": "Senha incorreta"}), 401
+        if senha != ADMIN_PASSWORD:
+            return jsonify({"success": False, "error": "Senha incorreta"}), 401
 
-    tipos_dias = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "perm": -1}
-    if tipo not in tipos_dias:
-        return jsonify({"success": False, "error": "Tipo invalido"}), 400
+        tipos_dias = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "perm": -1}
+        if tipo not in tipos_dias:
+            return jsonify({"success": False, "error": "Tipo invalido"}), 400
 
-    dias = tipos_dias[tipo]
-    keys = []
+        dias = tipos_dias[tipo]
+        quantidade = max(1, min(quantidade, 200))
 
-    con = db()
-    cur = con.cursor()
+        conn = db_conn()
+        keys_geradas = []
+        for _ in range(quantidade):
+            k = gerar_key_unica()
+            conn.execute(
+                "INSERT INTO keys (key, tipo, dias, data_criacao) VALUES (?, ?, ?, ?)",
+                (k, tipo, dias, now_str())
+            )
+            keys_geradas.append(k)
+        conn.commit()
+        conn.close()
 
-    for _ in range(max(1, quantidade)):
-        k = gerar_key_unica()
-        cur.execute(
-            "INSERT INTO licenses (license_key, tipo, dias, ativada, data_criacao) VALUES (?, ?, ?, 0, ?)",
-            (k, tipo, dias, utcnow_str()),
-        )
-        keys.append(k)
+        return jsonify({"success": True, "keys": keys_geradas, "tipo": tipo, "quantidade": len(keys_geradas)})
 
-    con.commit()
-    con.close()
-
-    return jsonify({"success": True, "tipo": tipo, "quantidade": len(keys), "keys": keys})
-
-
-@app.route("/stats", methods=["POST"])
-def stats():
-    data = request.get_json(silent=True) or {}
-    senha = data.get("senha")
-    if senha != ADMIN_PASSWORD:
-        return jsonify({"success": False, "error": "Senha incorreta"}), 401
-
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM licenses")
-    total_keys = int(cur.fetchone()["c"])
-    cur.execute("SELECT COUNT(*) AS c FROM licenses WHERE ativada = 1")
-    keys_ativas = int(cur.fetchone()["c"])
-    cur.execute("SELECT COUNT(*) AS c FROM customers")
-    total_clientes = int(cur.fetchone()["c"])
-
-    cur.execute("SELECT * FROM logs ORDER BY data DESC LIMIT 50")
-    logs_raw = cur.fetchall()
-    con.close()
-
-    logs = []
-    for r in logs_raw:
-        logs.append({
-            "id": r["id"],
-            "customer_id": r["customer_id"] or "N/A",
-            "hwid": (r["hwid"][:16] + "...") if r["hwid"] else "N/A",
-            "acao": r["acao"],
-            "data": r["data"],
-            "detalhes": r["detalhes"] or "",
-        })
-
-    return jsonify({
-        "success": True,
-        "stats": {
-            "total_keys": total_keys,
-            "keys_ativas": keys_ativas,
-            "keys_pendentes": total_keys - keys_ativas,
-            "total_clientes": total_clientes,
-            "max_devices": MAX_DEVICES,
-        },
-        "logs": logs,
-    })
-
-
-# ---------------- CLIENTE ----------------
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/ativar-key", methods=["POST"])
 def ativar_key():
-    """
-    Cliente envia: {"key":"...", "hwid":"..."}
-    Servidor responde: token + tipo + expiracao
-    """
-    data = request.get_json(silent=True) or {}
-    license_key = (data.get("key") or "").upper().strip()
-    hwid = (data.get("hwid") or "").strip()
+    try:
+        data = request.get_json(silent=True) or {}
+        key = (data.get("key") or "").upper().strip()
+        hwid = (data.get("hwid") or "").strip()
 
-    if not license_key or not hwid:
-        return jsonify({"success": False, "error": "Key e HWID sao obrigatorios"}), 400
+        if not key or not hwid:
+            return jsonify({"success": False, "error": "Key e HWID sao obrigatorios"}), 400
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
-    lic = cur.fetchone()
+        conn = db_conn()
+        row = conn.execute("SELECT * FROM keys WHERE key = ?", (key,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"success": False, "error": "Key nao encontrada"}), 404
 
-    if not lic:
-        con.close()
-        return jsonify({"success": False, "error": "Key nao encontrada"}), 404
+        if row["ativada"] == 1:
+            conn.close()
+            return jsonify({"success": False, "error": "Key ja foi ativada em outro PC"}), 403
 
-    if int(lic["ativada"]) == 1:
-        con.close()
-        return jsonify({"success": False, "error": "Key ja foi ativada"}), 403
+        data_exp = calcular_expiracao(row["dias"])
+        conn.execute("""
+            UPDATE keys
+            SET ativada = 1, hwid = ?, data_ativacao = ?, data_expiracao = ?
+            WHERE key = ?
+        """, (hwid, now_str(), data_exp, key))
 
-    tipo = lic["tipo"]
-    dias = int(lic["dias"])
-    customer_id = gerar_customer_id()
-    token = gerar_token()
+        conn.commit()
+        conn.close()
 
-    data_ativ = utcnow_str()
-    data_exp = calcular_expiracao(dias)
+        registrar_log(hwid, "KEY_ATIVADA", f"Key: {key[:8]}..., Tipo: {row['tipo']}")
+        return jsonify({"success": True, "message": "Key ativada com sucesso!", "tipo": row["tipo"], "data_expiracao": data_exp})
 
-    # cria customer
-    cur.execute(
-        "INSERT INTO customers (customer_id, token_hash, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)",
-        (customer_id, sha256_hex(token), data_ativ, data_ativ),
-    )
-
-    # ativa license
-    cur.execute(
-        """UPDATE licenses
-           SET ativada = 1, customer_id = ?, hwid_primeiro = ?, data_ativacao = ?, data_expiracao = ?
-           WHERE license_key = ?""",
-        (customer_id, hwid, data_ativ, data_exp, license_key),
-    )
-
-    # registra device
-    cur.execute(
-        "INSERT INTO devices (customer_id, hwid, first_seen, last_seen) VALUES (?, ?, ?, ?)",
-        (customer_id, hwid, data_ativ, data_ativ),
-    )
-
-    con.commit()
-    con.close()
-
-    registrar_log(customer_id, hwid, "KEY_ATIVADA", f"Tipo={tipo}, exp={data_exp}")
-
-    return jsonify({
-        "success": True,
-        "message": "Key ativada com sucesso!",
-        "tipo": tipo,
-        "data_expiracao": data_exp,
-        "client_token": token,
-        "max_devices": MAX_DEVICES,
-    })
-
-
-@app.route("/cliente/set-salasff-key", methods=["POST"])
-def set_salasff_key():
-    """
-    Cliente cadastra a API key DELE.
-    Requer headers auth (token + assinatura).
-    Body: {"hwid":"...", "salasff_key":"..."}
-    """
-    ok, customer_id, err = autenticar_cliente_requisicao()
-    if not ok:
-        return jsonify({"success": False, "error": err}), 401
-
-    data = request.get_json(silent=True) or {}
-    hwid = (data.get("hwid") or "").strip()
-    salasff_key = (data.get("salasff_key") or "").strip()
-
-    if not salasff_key:
-        return jsonify({"success": False, "error": "salasff_key obrigatoria"}), 400
-
-    ok_hwid, msg = validar_hwid_do_cliente(customer_id, hwid)
-    if not ok_hwid:
-        registrar_log(customer_id, hwid, "SET_KEY_NEGADO", msg)
-        return jsonify({"success": False, "error": msg}), 403
-
-    enc = _xor_encrypt_to_b64(salasff_key, MASTER_KEY)
-
-    con = db()
-    cur = con.cursor()
-    cur.execute(
-        "UPDATE customers SET salasff_key_enc = ?, updated_at = ? WHERE customer_id = ?",
-        (enc, utcnow_str(), customer_id),
-    )
-    con.commit()
-    con.close()
-
-    registrar_log(customer_id, hwid, "SET_SALASFF_KEY", "OK")
-    return jsonify({"success": True, "message": "API key cadastrada com sucesso!"})
-
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/validar-licenca", methods=["POST"])
 def validar_licenca():
-    """
-    Valida token + licenca.
-    Requer headers auth.
-    Body: {"hwid":"..."}
-    """
-    ok, customer_id, err = autenticar_cliente_requisicao()
-    if not ok:
-        return jsonify({"success": False, "error": err}), 401
-
-    data = request.get_json(silent=True) or {}
-    hwid = (data.get("hwid") or "").strip()
-
-    ok_hwid, msg = validar_hwid_do_cliente(customer_id, hwid)
-    if not ok_hwid:
-        return jsonify({"success": True, "valida": False, "error": msg}), 403
-
-    ok_lic, msg_lic = checar_licenca_customer(customer_id)
-    if not ok_lic:
-        return jsonify({"success": True, "valida": False, "error": msg_lic}), 200
-
-    has_key, _ = cliente_tem_key(customer_id)
-    return jsonify({"success": True, "valida": True, "tem_api_key": has_key})
-
-
-# ---------------- PROXY (usa API key do CLIENTE) ----------------
-
-@app.route("/proxy-criar-sala", methods=["POST"])
-def proxy_criar_sala():
-    ok, customer_id, err = autenticar_cliente_requisicao()
-    if not ok:
-        return jsonify({"success": False, "error": err}), 401
-
-    data = request.get_json(silent=True) or {}
-    hwid = (data.get("hwid") or "").strip()
-    modo_id = data.get("modo_id")
-    iniciar_em = int(data.get("iniciar_em", 4))
-
-    ok_hwid, msg = validar_hwid_do_cliente(customer_id, hwid)
-    if not ok_hwid:
-        registrar_log(customer_id, hwid, "CRIAR_SALA_NEGADO", msg)
-        return jsonify({"success": False, "error": msg}), 403
-
-    ok_lic, msg_lic = checar_licenca_customer(customer_id)
-    if not ok_lic:
-        registrar_log(customer_id, hwid, "CRIAR_SALA_NEGADO", msg_lic)
-        return jsonify({"success": False, "error": msg_lic}), 403
-
-    has_key, salasff_key = cliente_tem_key(customer_id)
-    if not has_key:
-        return jsonify({"success": False, "error": "Cliente sem API key cadastrada. Use /cliente/set-salasff-key"}), 400
-
-    if not modo_id:
-        return jsonify({"success": False, "error": "modo_id obrigatorio"}), 400
-
-    url = f"{SALASFF_API_URL}/criar?key={salasff_key}&salaid={modo_id}&iniciar={iniciar_em}"
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        resultado = resp.json()
-        registrar_log(customer_id, hwid, "CRIAR_SALA", f"modo={modo_id}, ok={resultado.get('success')}")
-        return jsonify(resultado)
+        data = request.get_json(silent=True) or {}
+        hwid = (data.get("hwid") or "").strip()
+        if not hwid:
+            return jsonify({"success": False, "error": "HWID e obrigatorio"}), 400
+
+        conn = db_conn()
+        row = conn.execute("SELECT * FROM keys WHERE hwid = ? AND ativada = 1", (hwid,)).fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({"success": False, "valida": False, "error": "Nenhuma licenca encontrada para este PC"}), 404
+
+        if verificar_expiracao(row["data_expiracao"]):
+            return jsonify({"success": True, "valida": False, "error": "Licenca expirada", "data_expiracao": row["data_expiracao"]})
+
+        return jsonify({"success": True, "valida": True, "tipo": row["tipo"], "data_expiracao": row["data_expiracao"]})
+
     except Exception as e:
-        registrar_log(customer_id, hwid, "CRIAR_SALA_ERRO", str(e))
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ---- Admin: setar SalasFF API key do cliente ----
+@app.route("/admin/set-salasff-key", methods=["POST"])
+def admin_set_salasff_key():
+    """
+    Body: {"senha":"...","hwid":"...","salasff_key":"..."}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        senha = data.get("senha")
+        hwid = (data.get("hwid") or "").strip()
+        salasff_key = (data.get("salasff_key") or "").strip()
+
+        if senha != ADMIN_PASSWORD:
+            return jsonify({"success": False, "error": "Senha incorreta"}), 401
+        if not hwid or not salasff_key:
+            return jsonify({"success": False, "error": "hwid e salasff_key sao obrigatorios"}), 400
+
+        conn = db_conn()
+        conn.execute("""
+            INSERT INTO clients (hwid, salasff_key, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(hwid) DO UPDATE SET
+                salasff_key=excluded.salasff_key,
+                updated_at=excluded.updated_at
+        """, (hwid, salasff_key, now_str()))
+        conn.commit()
+        conn.close()
+
+        registrar_log(hwid, "SET_SALASFF_KEY", "SalasFF key definida/atualizada")
+        return jsonify({"success": True})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# ---- Proxy: usa SalasFF key do cliente ----
+@app.route("/proxy-criar-sala", methods=["POST"])
+def proxy_criar_sala():
+    try:
+        data = request.get_json(silent=True) or {}
+        hwid = (data.get("hwid") or "").strip()
+        modo_id = data.get("modo_id")
+        iniciar_em = int(data.get("iniciar_em", 4))
+
+        if not hwid or not modo_id:
+            return jsonify({"success": False, "error": "hwid e modo_id sao obrigatorios"}), 400
+        if not validar_licenca_interna(hwid):
+            registrar_log(hwid, "CRIAR_SALA_NEGADO", "Licenca invalida/expirada")
+            return jsonify({"success": False, "error": "Licenca invalida ou expirada"}), 403
+
+        salasff_key = get_salasff_key_do_cliente(hwid)
+        if not salasff_key:
+            return jsonify({"success": False, "error": "Cliente sem SalasFF API key cadastrada (admin precisa setar)"}), 403
+
+        url = f"{SALASFF_API_URL}/criar?key={salasff_key}&salaid={modo_id}&iniciar={iniciar_em}"
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resultado = r.json()
+
+        registrar_log(hwid, "CRIAR_SALA", f"Modo: {modo_id}, Sucesso: {resultado.get('success')}")
+        return jsonify(resultado)
+
+    except Exception as e:
+        registrar_log((locals().get("hwid") or "DESCONHECIDO"), "CRIAR_SALA_ERRO", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/proxy-info-sala", methods=["POST"])
 def proxy_info_sala():
-    ok, customer_id, err = autenticar_cliente_requisicao()
-    if not ok:
-        return jsonify({"success": False, "error": err}), 401
-
-    data = request.get_json(silent=True) or {}
-    hwid = (data.get("hwid") or "").strip()
-    pedido_id = data.get("pedido_id")
-
-    ok_hwid, msg = validar_hwid_do_cliente(customer_id, hwid)
-    if not ok_hwid:
-        return jsonify({"success": False, "error": msg}), 403
-
-    ok_lic, msg_lic = checar_licenca_customer(customer_id)
-    if not ok_lic:
-        return jsonify({"success": False, "error": msg_lic}), 403
-
-    if not pedido_id:
-        return jsonify({"success": False, "error": "pedido_id obrigatorio"}), 400
-
-    url = f"{SALASFF_API_URL}/info?pedidoid={pedido_id}"
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        return jsonify(resp.json())
+        data = request.get_json(silent=True) or {}
+        hwid = (data.get("hwid") or "").strip()
+        pedido_id = data.get("pedido_id")
+
+        if not hwid or not pedido_id:
+            return jsonify({"success": False, "error": "hwid e pedido_id sao obrigatorios"}), 400
+        if not validar_licenca_interna(hwid):
+            return jsonify({"success": False, "error": "Licenca invalida ou expirada"}), 403
+
+        url = f"{SALASFF_API_URL}/info?pedidoid={pedido_id}"
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        return jsonify(r.json())
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/proxy-iniciar-partida", methods=["POST"])
 def proxy_iniciar_partida():
-    ok, customer_id, err = autenticar_cliente_requisicao()
-    if not ok:
-        return jsonify({"success": False, "error": err}), 401
-
-    data = request.get_json(silent=True) or {}
-    hwid = (data.get("hwid") or "").strip()
-    pedido_id = data.get("pedido_id")
-
-    ok_hwid, msg = validar_hwid_do_cliente(customer_id, hwid)
-    if not ok_hwid:
-        return jsonify({"success": False, "error": msg}), 403
-
-    ok_lic, msg_lic = checar_licenca_customer(customer_id)
-    if not ok_lic:
-        return jsonify({"success": False, "error": msg_lic}), 403
-
-    if not pedido_id:
-        return jsonify({"success": False, "error": "pedido_id obrigatorio"}), 400
-
-    url = f"{SALASFF_API_URL}/iniciar?pedidoid={pedido_id}"
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        resultado = resp.json()
-        registrar_log(customer_id, hwid, "INICIAR_PARTIDA", f"pedido={pedido_id}")
+        data = request.get_json(silent=True) or {}
+        hwid = (data.get("hwid") or "").strip()
+        pedido_id = data.get("pedido_id")
+
+        if not hwid or not pedido_id:
+            return jsonify({"success": False, "error": "hwid e pedido_id sao obrigatorios"}), 400
+        if not validar_licenca_interna(hwid):
+            return jsonify({"success": False, "error": "Licenca invalida ou expirada"}), 403
+
+        url = f"{SALASFF_API_URL}/iniciar?pedidoid={pedido_id}"
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resultado = r.json()
+
+        registrar_log(hwid, "INICIAR_PARTIDA", f"Pedido: {pedido_id}")
         return jsonify(resultado)
+
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-
-# ---------------- ADMIN PANEL (mesmo estilo, só com keys) ----------------
-
+# ---- Admin panel simples + nova função de setar key do cliente ----
 @app.route("/admin")
 def admin_panel():
     html = r"""
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8"/>
   <title>Painel Admin</title>
   <style>
     body{font-family:Arial;background:#111;color:#eee;padding:20px}
     .box{max-width:900px;margin:0 auto;background:#1b1b1b;padding:20px;border-radius:12px}
-    input,select,button{padding:10px;border-radius:8px;border:1px solid #333;width:100%;margin:6px 0}
-    button{background:#6c5ce7;color:#fff;border:none;cursor:pointer}
-    pre{background:#000;padding:12px;border-radius:10px;white-space:pre-wrap}
+    input,select,button{width:100%;padding:10px;margin:6px 0;border-radius:8px;border:1px solid #333;background:#0f0f0f;color:#eee}
+    button{background:#6c5ce7;border:none;font-weight:700;cursor:pointer}
+    pre{background:#0b0b0b;padding:12px;border-radius:10px;overflow:auto}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    @media(max-width:700px){.row{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
 <div class="box">
-  <h2>Painel Admin</h2>
-  <p>Gera keys e vê stats.</p>
+  <h1>Painel Admin</h1>
+  <p>Gera keys, vê stats e cadastra SalasFF API key do cliente.</p>
 
-  <h3>Gerar Keys</h3>
+  <h2>Gerar Keys</h2>
   <input id="senha" type="password" placeholder="Senha admin">
   <select id="tipo">
-    <option value="1d">1d</option>
-    <option value="7d">7d</option>
-    <option value="30d" selected>30d</option>
-    <option value="90d">90d</option>
-    <option value="perm">perm</option>
+    <option value="1d">1 dia</option>
+    <option value="7d">7 dias</option>
+    <option value="30d" selected>30 dias</option>
+    <option value="90d">90 dias</option>
+    <option value="perm">Permanente</option>
   </select>
-  <input id="qtd" type="number" min="1" max="100" value="1">
+  <input id="quantidade" type="number" value="1" min="1" max="200"/>
   <button onclick="gerar()">Gerar</button>
 
   <h3>Saída</h3>
-  <pre id="out">Aguardando...</pre>
+  <pre id="out">{}</pre>
 
-  <h3>Stats</h3>
+  <hr style="border:0;border-top:1px solid #333;margin:20px 0">
+
+  <h2>Cadastrar SalasFF API key do cliente</h2>
+  <div class="row">
+    <input id="hwid" placeholder="HWID do cliente (ele te manda)">
+    <input id="salasff" placeholder="SalasFF API key do cliente">
+  </div>
+  <button onclick="setKey()">Salvar SalasFF key no servidor</button>
+
+  <hr style="border:0;border-top:1px solid #333;margin:20px 0">
+
+  <h2>Stats</h2>
   <button onclick="stats()">Atualizar stats</button>
-  <pre id="stats">-</pre>
+  <pre id="stats">{}</pre>
 </div>
 
 <script>
-function gerar(){
-  const senha=document.getElementById('senha').value;
-  const tipo=document.getElementById('tipo').value;
-  const quantidade=parseInt(document.getElementById('qtd').value||"1",10);
-  fetch('/gerar-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha,tipo,quantidade})})
-    .then(r=>r.json()).then(d=>{
-      document.getElementById('out').textContent=JSON.stringify(d,null,2);
-    });
+function show(id, obj){ document.getElementById(id).textContent = JSON.stringify(obj, null, 2); }
+
+async function gerar(){
+  const senha = document.getElementById('senha').value;
+  const tipo = document.getElementById('tipo').value;
+  const quantidade = parseInt(document.getElementById('quantidade').value || "1");
+
+  const r = await fetch('/gerar-key', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({senha, tipo, quantidade})
+  });
+  show('out', await r.json());
 }
-function stats(){
-  const senha=document.getElementById('senha').value;
-  fetch('/stats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({senha})})
-    .then(r=>r.json()).then(d=>{
-      document.getElementById('stats').textContent=JSON.stringify(d,null,2);
-    });
+
+async function stats(){
+  const senha = document.getElementById('senha').value;
+  const r = await fetch('/stats', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({senha})
+  });
+  show('stats', await r.json());
+}
+
+async function setKey(){
+  const senha = document.getElementById('senha').value;
+  const hwid = document.getElementById('hwid').value;
+  const salasff_key = document.getElementById('salasff').value;
+
+  const r = await fetch('/admin/set-salasff-key', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({senha, hwid, salasff_key})
+  });
+  show('out', await r.json());
 }
 </script>
 </body>
@@ -721,12 +448,44 @@ function stats(){
 """
     return render_template_string(html)
 
+@app.route("/stats", methods=["POST"])
+def stats():
+    try:
+        data = request.get_json(silent=True) or {}
+        senha = data.get("senha")
+        if senha != ADMIN_PASSWORD:
+            return jsonify({"success": False, "error": "Senha incorreta"}), 401
 
-# =====================================================
-# Start
-# =====================================================
+        conn = db_conn()
+        total_keys = conn.execute("SELECT COUNT(*) AS n FROM keys").fetchone()["n"]
+        keys_ativas = conn.execute("SELECT COUNT(*) AS n FROM keys WHERE ativada = 1").fetchone()["n"]
+        keys_pendentes = total_keys - keys_ativas
+
+        logs_raw = conn.execute("SELECT * FROM logs ORDER BY data DESC LIMIT 50").fetchall()
+        conn.close()
+
+        logs = []
+        for row in logs_raw:
+            logs.append({
+                "id": row["id"],
+                "hwid": (row["hwid"][:16] + "...") if row["hwid"] else "N/A",
+                "acao": row["acao"],
+                "data": row["data"],
+                "detalhes": row["detalhes"],
+            })
+
+        return jsonify({
+            "success": True,
+            "stats": {"total_keys": total_keys, "keys_ativas": keys_ativas, "keys_pendentes": keys_pendentes},
+            "logs": logs
+        })
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# Inicializa DB SEM depender do __main__
+init_db()
 
 if __name__ == "__main__":
-    init_db()
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
