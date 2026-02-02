@@ -11,7 +11,7 @@ app = Flask(__name__)
 # CONFIG
 # =====================================================
 DB_NAME = "licencas.db"
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "troque-essa-senha")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Wb03122008!")
 REQUEST_TIMEOUT = 10  # reservado caso você use requests no futuro
 
 # =====================================================
