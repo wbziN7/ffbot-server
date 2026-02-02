@@ -21,7 +21,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
 # Chave para "proteger" a API key do cliente no banco (melhor que nada)
 # Coloque uma string grande no Railway Variables: MASTER_KEY
-MASTER_KEY = os.getenv("MASTER_KEY", "TROQUE_ESSA_MASTER_KEY_GIGANTE_AQUI")
+MASTER_KEY = os.getenv("MASTER_KEY", "HGIJFS8VDW8V7V4J73M2RV283RN732VNGF283FVGN238RVGN2387RV32BGR872FH892HFNMC8732RV32Y")
 
 # Limite de dispositivos por licença (anti-compartilhamento)
 MAX_DEVICES = int(os.getenv("MAX_DEVICES", "1"))
