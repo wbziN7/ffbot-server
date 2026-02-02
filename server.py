@@ -14,7 +14,7 @@ app = Flask(__name__)
 # =====================================================
 # CONFIG (Railway Variables recomendado)
 # =====================================================
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "TROQUE_ISSO_AGORA")
+ADMIN_PASSWORD = os.getenv("Wb03122008!", "Wb03122008!")
 DB_NAME = os.getenv("DB_NAME", "licencas.db")
 SALASFF_API_URL = os.getenv("SALASFF_API_URL", "https://salasff.com")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
