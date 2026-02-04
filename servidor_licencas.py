@@ -72,6 +72,7 @@ def home():
             "POST /gerar-key": "Gera uma nova key",
             "POST /ativar-key": "Ativa uma key no HWID",
             "POST /validar-licenca": "Valida se licença está ativa",
+            "POST /listar-licencas": "Lista todas as licenças",
             "GET /admin": "Painel administrativo"
         }
     })
@@ -242,6 +243,94 @@ def validar_licenca():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route('/listar-licencas', methods=['POST'])
+def listar_licencas():
+    """Lista todas as licenças com detalhes"""
+    try:
+        data = request.json
+        senha = data.get('senha')
+        
+        if senha != ADMIN_PASSWORD:
+            return jsonify({"success": False, "error": "Senha incorreta"}), 401
+        
+        conn = sqlite3.connect('licencas.db')
+        c = conn.cursor()
+        
+        c.execute('SELECT * FROM keys ORDER BY data_criacao DESC')
+        resultados = c.fetchall()
+        
+        conn.close()
+        
+        licencas = []
+        total = len(resultados)
+        ativas = 0
+        pendentes = 0
+        expiradas = 0
+        
+        for row in resultados:
+            key, tipo, dias, ativada, hwid, nome_discord, telegram_id, data_ativ, data_exp, data_cria = row
+            
+            # Calcular dias restantes
+            dias_restantes = "N/A"
+            status = "Pendente"
+            status_color = "gray"
+            
+            if ativada == 1:
+                if data_exp == "PERMANENTE":
+                    dias_restantes = "∞"
+                    status = "Ativa"
+                    status_color = "green"
+                    ativas += 1
+                else:
+                    try:
+                        data_expiracao_obj = datetime.strptime(data_exp, "%Y-%m-%d %H:%M:%S")
+                        dias_faltam = (data_expiracao_obj - datetime.now()).days
+                        
+                        if dias_faltam < 0:
+                            dias_restantes = "Expirada"
+                            status = "Expirada"
+                            status_color = "red"
+                            expiradas += 1
+                        else:
+                            dias_restantes = f"{dias_faltam}d"
+                            status = "Ativa"
+                            status_color = "green"
+                            ativas += 1
+                    except:
+                        dias_restantes = "Erro"
+                        status = "Erro"
+                        status_color = "orange"
+            else:
+                pendentes += 1
+            
+            licencas.append({
+                'key': key,
+                'tipo': tipo,
+                'status': status,
+                'status_color': status_color,
+                'nome_discord': nome_discord or "N/A",
+                'telegram_id': telegram_id or "N/A",
+                'hwid': hwid[:20] + "..." if hwid else "N/A",
+                'dias_restantes': dias_restantes,
+                'data_ativacao': data_ativ or "N/A",
+                'data_expiracao': data_exp or "N/A",
+                'data_criacao': data_cria
+            })
+        
+        return jsonify({
+            "success": True,
+            "licencas": licencas,
+            "stats": {
+                "total": total,
+                "ativas": ativas,
+                "pendentes": pendentes,
+                "expiradas": expiradas
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/admin')
 def admin_panel():
     """Painel administrativo"""
@@ -251,6 +340,7 @@ def admin_panel():
 <head>
     <title>Painel Admin - Licenças</title>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -260,7 +350,7 @@ def admin_panel():
             padding: 20px;
         }
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
             background: white;
             border-radius: 20px;
@@ -272,6 +362,11 @@ def admin_panel():
             margin-bottom: 30px;
             text-align: center;
             font-size: 2.5em;
+        }
+        h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.5em;
         }
         .form-section {
             background: #f8f9fa;
@@ -310,6 +405,7 @@ def admin_panel():
             cursor: pointer;
             font-weight: 600;
             transition: transform 0.2s;
+            margin-right: 10px;
         }
         button:hover {
             transform: translateY(-2px);
@@ -324,6 +420,7 @@ def admin_panel():
             min-height: 100px;
             max-height: 300px;
             overflow-y: auto;
+            white-space: pre-wrap;
         }
         .stats {
             display: grid;
@@ -347,6 +444,65 @@ def admin_panel():
             font-size: 1.1em;
             opacity: 0.9;
         }
+        .table-container {
+            overflow-x: auto;
+            margin-top: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 13px;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
+        .status-badge {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            display: inline-block;
+        }
+        .status-green {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status-red {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .status-gray {
+            background: #e2e3e5;
+            color: #383d41;
+        }
+        .key-cell {
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            color: #667eea;
+            font-weight: 600;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 18px;
+        }
     </style>
 </head>
 <body>
@@ -365,6 +521,10 @@ def admin_panel():
             <div class="stat-card">
                 <div class="stat-label">Keys Pendentes</div>
                 <div class="stat-number" id="keys-pendentes">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Keys Expiradas</div>
+                <div class="stat-number" id="keys-expiradas">0</div>
             </div>
         </div>
         
@@ -391,12 +551,23 @@ def admin_panel():
             <button onclick="gerarKeys()">🚀 Gerar Keys</button>
             
             <div class="keys-output" id="output">
-                Aguardando geração de keys...
+Aguardando geração de keys...
+            </div>
+        </div>
+        
+        <div class="form-section">
+            <h2>📊 Lista de Licenças</h2>
+            <button onclick="carregarLicencas()">🔄 Atualizar Lista</button>
+            
+            <div class="table-container" id="tabela-container">
+                <div class="loading">Clique em "Atualizar Lista" para carregar...</div>
             </div>
         </div>
     </div>
     
     <script>
+        let senhaGlobal = '';
+        
         function gerarKeys() {
             const senha = document.getElementById('senha').value;
             const tipo = document.getElementById('tipo').value;
@@ -408,6 +579,7 @@ def admin_panel():
                 return;
             }
             
+            senhaGlobal = senha;
             output.innerHTML = '⏳ Gerando keys...';
             
             fetch('/gerar-key', {
@@ -424,7 +596,7 @@ def admin_panel():
                     data.keys.forEach(key => {
                         output.innerHTML += key + '\\n';
                     });
-                    carregarStats();
+                    carregarLicencas();
                 } else {
                     output.innerHTML = `❌ ERRO: ${data.error}`;
                 }
@@ -434,13 +606,74 @@ def admin_panel():
             });
         }
         
-        function carregarStats() {
-            // Aqui você pode adicionar uma rota para buscar estatísticas
-            // Por enquanto, vamos deixar fixo
+        function carregarLicencas() {
+            const senha = senhaGlobal || document.getElementById('senha').value;
+            const container = document.getElementById('tabela-container');
+            
+            if (!senha) {
+                container.innerHTML = '<div class="loading">❌ Digite a senha admin primeiro!</div>';
+                return;
+            }
+            
+            container.innerHTML = '<div class="loading">⏳ Carregando licenças...</div>';
+            
+            fetch('/listar-licencas', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({senha})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    // Atualizar stats
+                    document.getElementById('total-keys').innerText = data.stats.total;
+                    document.getElementById('keys-ativas').innerText = data.stats.ativas;
+                    document.getElementById('keys-pendentes').innerText = data.stats.pendentes;
+                    document.getElementById('keys-expiradas').innerText = data.stats.expiradas;
+                    
+                    // Criar tabela
+                    if (data.licencas.length === 0) {
+                        container.innerHTML = '<div class="loading">Nenhuma licença cadastrada ainda.</div>';
+                        return;
+                    }
+                    
+                    let html = '<table><thead><tr>';
+                    html += '<th>Status</th>';
+                    html += '<th>Discord</th>';
+                    html += '<th>Telegram</th>';
+                    html += '<th>Key</th>';
+                    html += '<th>Tipo</th>';
+                    html += '<th>Dias Restantes</th>';
+                    html += '<th>Data Ativação</th>';
+                    html += '<th>Expira em</th>';
+                    html += '</tr></thead><tbody>';
+                    
+                    data.licencas.forEach(lic => {
+                        const statusClass = lic.status_color === 'green' ? 'status-green' : 
+                                          lic.status_color === 'red' ? 'status-red' : 'status-gray';
+                        
+                        html += '<tr>';
+                        html += `<td><span class="status-badge ${statusClass}">${lic.status}</span></td>`;
+                        html += `<td>${lic.nome_discord}</td>`;
+                        html += `<td>${lic.telegram_id}</td>`;
+                        html += `<td class="key-cell">${lic.key}</td>`;
+                        html += `<td>${lic.tipo}</td>`;
+                        html += `<td><strong>${lic.dias_restantes}</strong></td>`;
+                        html += `<td>${lic.data_ativacao}</td>`;
+                        html += `<td>${lic.data_expiracao}</td>`;
+                        html += '</tr>';
+                    });
+                    
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+                } else {
+                    container.innerHTML = `<div class="loading">❌ ${data.error}</div>`;
+                }
+            })
+            .catch(err => {
+                container.innerHTML = `<div class="loading">❌ Erro: ${err}</div>`;
+            });
         }
-        
-        // Carregar stats ao abrir página
-        carregarStats();
     </script>
 </body>
 </html>
@@ -463,9 +696,10 @@ if __name__ == '__main__':
     print("  POST /gerar-key - Gera novas keys")
     print("  POST /ativar-key - Ativa uma key")
     print("  POST /validar-licenca - Valida licença")
+    print("  POST /listar-licencas - Lista todas as licenças")
     print("  GET /admin - Painel administrativo")
-    print("\n🔐 Senha admin padrão: admin123")
-    print("⚠️  MUDE A SENHA NA LINHA 12 DO CÓDIGO!")
+    print("\n🔐 Senha admin: Wb03122008!")
+    print("⚠️  MUDE A SENHA NA LINHA 11 DO CÓDIGO!")
     print("\n" + "="*60)
     
     # Railway fornece a porta via variável de ambiente
