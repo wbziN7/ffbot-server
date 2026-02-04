@@ -331,6 +331,77 @@ def listar_licencas():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route('/deletar-key', methods=['POST'])
+def deletar_key():
+    """Deleta uma key completamente"""
+    try:
+        data = request.json
+        senha = data.get('senha')
+        key = data.get('key', '').upper().strip()
+        
+        if senha != ADMIN_PASSWORD:
+            return jsonify({"success": False, "error": "Senha incorreta"}), 401
+        
+        if not key:
+            return jsonify({"success": False, "error": "Key é obrigatória"}), 400
+        
+        conn = sqlite3.connect('licencas.db')
+        c = conn.cursor()
+        
+        c.execute('DELETE FROM keys WHERE key = ?', (key,))
+        
+        if c.rowcount == 0:
+            conn.close()
+            return jsonify({"success": False, "error": "Key não encontrada"}), 404
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "message": "Key deletada com sucesso!"
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/desativar-key', methods=['POST'])
+def desativar_key():
+    """Desativa uma key (libera para uso em outro PC)"""
+    try:
+        data = request.json
+        senha = data.get('senha')
+        key = data.get('key', '').upper().strip()
+        
+        if senha != ADMIN_PASSWORD:
+            return jsonify({"success": False, "error": "Senha incorreta"}), 401
+        
+        if not key:
+            return jsonify({"success": False, "error": "Key é obrigatória"}), 400
+        
+        conn = sqlite3.connect('licencas.db')
+        c = conn.cursor()
+        
+        c.execute('''UPDATE keys 
+                    SET ativada = 0, hwid = NULL, nome_discord = NULL, 
+                        telegram_id = NULL, data_ativacao = NULL, data_expiracao = NULL
+                    WHERE key = ?''', (key,))
+        
+        if c.rowcount == 0:
+            conn.close()
+            return jsonify({"success": False, "error": "Key não encontrada"}), 404
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "message": "Key desativada! Agora pode ser usada novamente."
+        })
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @app.route('/admin')
 def admin_panel():
     """Painel administrativo"""
@@ -503,6 +574,31 @@ def admin_panel():
             color: #667eea;
             font-size: 18px;
         }
+        .btn-small {
+            padding: 8px 15px;
+            font-size: 14px;
+            margin: 0 3px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            transition: all 0.2s;
+        }
+        .btn-warning {
+            background: #ffc107;
+            color: #000;
+        }
+        .btn-warning:hover {
+            background: #ffb300;
+            transform: scale(1.05);
+        }
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #c82333;
+            transform: scale(1.05);
+        }
     </style>
 </head>
 <body>
@@ -646,6 +742,7 @@ Aguardando geração de keys...
                     html += '<th>Dias Restantes</th>';
                     html += '<th>Data Ativação</th>';
                     html += '<th>Expira em</th>';
+                    html += '<th>Ações</th>';
                     html += '</tr></thead><tbody>';
                     
                     data.licencas.forEach(lic => {
@@ -661,6 +758,10 @@ Aguardando geração de keys...
                         html += `<td><strong>${lic.dias_restantes}</strong></td>`;
                         html += `<td>${lic.data_ativacao}</td>`;
                         html += `<td>${lic.data_expiracao}</td>`;
+                        html += `<td style="white-space: nowrap;">`;
+                        html += `<button class="btn-small btn-warning" onclick="desativarKey('${lic.key}')" title="Desativar (libera para usar novamente)">🔄</button> `;
+                        html += `<button class="btn-small btn-danger" onclick="deletarKey('${lic.key}')" title="Deletar permanentemente">🗑️</button>`;
+                        html += `</td>`;
                         html += '</tr>';
                     });
                     
@@ -672,6 +773,58 @@ Aguardando geração de keys...
             })
             .catch(err => {
                 container.innerHTML = `<div class="loading">❌ Erro: ${err}</div>`;
+            });
+        }
+        
+        function desativarKey(key) {
+            if (!confirm(`Deseja DESATIVAR a key ${key}?\\n\\nIsso vai liberar ela para ser usada novamente em outro PC.`)) {
+                return;
+            }
+            
+            const senha = senhaGlobal || document.getElementById('senha').value;
+            
+            fetch('/desativar-key', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({senha, key})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    alert('✅ ' + data.message);
+                    carregarLicencas();
+                } else {
+                    alert('❌ ' + data.error);
+                }
+            })
+            .catch(err => {
+                alert('❌ Erro: ' + err);
+            });
+        }
+        
+        function deletarKey(key) {
+            if (!confirm(`⚠️ ATENÇÃO!\\n\\nDeseja DELETAR PERMANENTEMENTE a key ${key}?\\n\\nIsso NÃO PODE ser desfeito!`)) {
+                return;
+            }
+            
+            const senha = senhaGlobal || document.getElementById('senha').value;
+            
+            fetch('/deletar-key', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({senha, key})
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    alert('✅ ' + data.message);
+                    carregarLicencas();
+                } else {
+                    alert('❌ ' + data.error);
+                }
+            })
+            .catch(err => {
+                alert('❌ Erro: ' + err);
             });
         }
     </script>
@@ -697,6 +850,8 @@ if __name__ == '__main__':
     print("  POST /ativar-key - Ativa uma key")
     print("  POST /validar-licenca - Valida licença")
     print("  POST /listar-licencas - Lista todas as licenças")
+    print("  POST /deletar-key - Deleta uma key permanentemente")
+    print("  POST /desativar-key - Desativa uma key (libera para reuso)")
     print("  GET /admin - Painel administrativo")
     print("\n🔐 Senha admin: Wb03122008!")
     print("⚠️  MUDE A SENHA NA LINHA 11 DO CÓDIGO!")
